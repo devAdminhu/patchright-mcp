@@ -1,0 +1,58 @@
+{
+  "name": "@devadminhu/patchright-mcp",
+  "version": "0.1.1",
+  "description": "MCP server for real-time browser automation and debugging via Patchright (Playwright stealth fork). 69 tools: stealth, network intercept, multi-tab, raw CDP, session storage.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "patchright",
+    "playwright",
+    "browser-automation",
+    "stealth",
+    "websocket",
+    "network-intercept",
+    "cdp",
+    "chrome-devtools-protocol"
+  ],
+  "type": "module",
+  "main": "build/index.js",
+  "files": [
+    "build",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node build/index.js",
+    "prepare": "tsc"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "patchright": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": false,
+  "license": "MIT",
+  "author": "devadminhu",
+  "homepage": "https://github.com/devadminhu/patchright-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/devadminhu/patchright-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/devadminhu/patchright-mcp/issues"
+  },
+  "bin": {
+    "patchright-mcp": "./build/index.js"
+  }
+}
