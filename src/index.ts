@@ -187,6 +187,49 @@ function attachPageHandlers(session: DebugSession, page: Page, sessionId: string
   })
 }
 
+// Executa UMA ação do batch (sequencial ou paralelo) e devolve a linha de log de sucesso.
+// Lança em erro/tipo desconhecido — quem chama decide se para ou só registra o ✗.
+async function runAction(page: Page, a: Record<string, any>, i: number): Promise<string> {
+  switch (a.type) {
+    case "fill":
+      await page.fill(a.selector, a.value)
+      await page.evaluate((sel: string) => {
+        const el = document.querySelector(sel) as HTMLInputElement
+        el?.dispatchEvent(new Event("change", { bubbles: true }))
+        el?.dispatchEvent(new Event("input", { bubbles: true }))
+      }, a.selector)
+      return `[${i}] ✓ fill ${a.selector}`
+    case "click":
+      await page.click(a.selector)
+      return `[${i}] ✓ click ${a.selector}`
+    case "press":
+      await page.keyboard.press(a.key)
+      return `[${i}] ✓ press ${a.key}`
+    case "wait":
+      if (a.selector) {
+        await page.waitForSelector(a.selector, { timeout: a.timeout || 5000 })
+        return `[${i}] ✓ wait selector ${a.selector}`
+      }
+      await new Promise((r) => setTimeout(r, a.ms || 1000))
+      return `[${i}] ✓ wait ${a.ms || 1000}ms`
+    case "eval": {
+      const result = await page.evaluate(a.script)
+      return `[${i}] ✓ eval → ${JSON.stringify(result).slice(0, 200)}`
+    }
+    case "select":
+      await page.selectOption(a.selector, a.value)
+      return `[${i}] ✓ select ${a.selector}=${a.value}`
+    case "hover":
+      await page.hover(a.selector)
+      return `[${i}] ✓ hover ${a.selector}`
+    case "screenshot":
+      await page.screenshot({ path: a.path, fullPage: a.fullPage !== false })
+      return `[${i}] ✓ screenshot ${a.path}`
+    default:
+      throw new Error(`unknown action type: ${a.type}`)
+  }
+}
+
 const server = new Server(
   {
     name: "patchright-mcp",
@@ -388,6 +431,27 @@ const tools: Tool[] = [
         stopOnError: {
           type: "boolean",
           description: "Default true: para no primeiro erro",
+        },
+      },
+      required: ["sessionId", "actions"],
+    },
+  },
+  {
+    name: "batch_parallel",
+    description:
+      "BATCH PARALELO: executa array de ações EM PARALELO (concorrente) via Promise.allSettled — dispara tudo de uma vez, uma falha não derruba as outras. Mesmos tipos do batch_actions (fill, click, press, wait, eval, select, hover, screenshot). Use SÓ pra ações independentes no mesmo page (ex: vários eval/leituras). Ações que disputam foco/navegação podem dar corrida — responsabilidade de quem chama. Log indexado na ordem de entrada.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        sessionId: { type: "string" },
+        actions: {
+          type: "array",
+          items: { type: "object" },
+          description: "[{type:'eval', script}, {type:'click', selector}, {type:'fill', selector, value}, {type:'wait', ms}, ...] — mesmos tipos do batch_actions",
+        },
+        concurrency: {
+          type: "number",
+          description: "Default ilimitado (todas de uma vez). Se passado, roda em lotes desse tamanho via pool na mão",
         },
       },
       required: ["sessionId", "actions"],
@@ -1651,58 +1715,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         for (let i = 0; i < actions.length; i++) {
           const a = actions[i]
           try {
-            switch (a.type) {
-              case "fill":
-                await page.fill(a.selector, a.value)
-                await page.evaluate((sel: string) => {
-                  const el = document.querySelector(sel) as HTMLInputElement
-                  el?.dispatchEvent(new Event("change", { bubbles: true }))
-                  el?.dispatchEvent(new Event("input", { bubbles: true }))
-                }, a.selector)
-                log.push(`[${i}] ✓ fill ${a.selector}`)
-                break
-              case "click":
-                await page.click(a.selector)
-                log.push(`[${i}] ✓ click ${a.selector}`)
-                break
-              case "press":
-                await page.keyboard.press(a.key)
-                log.push(`[${i}] ✓ press ${a.key}`)
-                break
-              case "wait":
-                if (a.selector) {
-                  await page.waitForSelector(a.selector, { timeout: a.timeout || 5000 })
-                  log.push(`[${i}] ✓ wait selector ${a.selector}`)
-                } else {
-                  await new Promise((r) => setTimeout(r, a.ms || 1000))
-                  log.push(`[${i}] ✓ wait ${a.ms || 1000}ms`)
-                }
-                break
-              case "eval": {
-                const result = await page.evaluate(a.script)
-                log.push(`[${i}] ✓ eval → ${JSON.stringify(result).slice(0, 200)}`)
-                break
-              }
-              case "select":
-                await page.selectOption(a.selector, a.value)
-                log.push(`[${i}] ✓ select ${a.selector}=${a.value}`)
-                break
-              case "hover":
-                await page.hover(a.selector)
-                log.push(`[${i}] ✓ hover ${a.selector}`)
-                break
-              case "screenshot":
-                await page.screenshot({ path: a.path, fullPage: a.fullPage !== false })
-                log.push(`[${i}] ✓ screenshot ${a.path}`)
-                break
-              default:
-                log.push(`[${i}] ✗ unknown type: ${a.type}`)
-                if (stopOnError) throw new Error(`unknown action type: ${a.type}`)
-            }
+            log.push(await runAction(page, a, i))
           } catch (e) {
             log.push(`[${i}] ✗ ${a.type}: ${e instanceof Error ? e.message : String(e)}`)
             if (stopOnError) break
           }
+        }
+        return { content: [{ type: "text", text: log.join("\n") }] }
+      }
+
+      case "batch_parallel": {
+        const session = sessions.get(sessionId)
+        if (!session?.page) {
+          return { content: [{ type: "text", text: "Sem página" }], isError: true }
+        }
+        const actions = (args as Record<string, any[]>).actions || []
+        const concurrency = (args as Record<string, number>).concurrency
+        const page = session.page
+        // log indexado na ordem de ENTRADA, não na de conclusão
+        const log: string[] = new Array(actions.length)
+        // dispara uma ação e registra ✓/✗ na posição i (nunca rejeita — Promise.allSettled cuida do resto)
+        const run = (i: number) =>
+          runAction(page, actions[i], i)
+            .then((line) => { log[i] = line })
+            .catch((e) => { log[i] = `[${i}] ✗ ${actions[i]?.type}: ${e instanceof Error ? e.message : String(e)}` })
+        if (concurrency && concurrency > 0) {
+          // pool simples na mão: lotes de tamanho concurrency
+          for (let start = 0; start < actions.length; start += concurrency) {
+            const batch = []
+            for (let i = start; i < Math.min(start + concurrency, actions.length); i++) batch.push(run(i))
+            await Promise.allSettled(batch)
+          }
+        } else {
+          // sem limite: dispara tudo de uma vez
+          await Promise.allSettled(actions.map((_, i) => run(i)))
         }
         return { content: [{ type: "text", text: log.join("\n") }] }
       }
