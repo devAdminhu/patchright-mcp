@@ -1,6 +1,6 @@
 {
   "name": "@devadminhu/patchright-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server for real-time browser automation and debugging via Patchright (Playwright stealth fork). 69 tools: stealth, network intercept, multi-tab, raw CDP, session storage.",
   "keywords": [
     "mcp",
