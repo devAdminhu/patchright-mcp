@@ -7,7 +7,7 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js"
 import { chromium, type Browser, type BrowserContext, type Page } from "patchright"
-import { mkdirSync, appendFileSync, writeFileSync, readFileSync, existsSync, openSync, closeSync, statSync, unlinkSync } from "fs"
+import { mkdirSync, writeFileSync, readFileSync, existsSync, openSync, closeSync, writeSync, fsyncSync, statSync, unlinkSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
 
@@ -18,8 +18,14 @@ const _CF_BYPASS_ARGS = [
   "--disable-blink-features=AutomationControlled",
   "--disable-features=IsolateOrigins,site-per-process",
   "--disable-site-isolation-trials",
-  "--no-sandbox",
 ]
+
+// --no-sandbox é opt-in: risco de segurança, só entra quando explicitamente pedido ou
+// quando rodando como root (Chrome recusa sandbox como root e crasha sem isso).
+function needsNoSandbox(explicit: boolean | undefined): boolean {
+  if (explicit === true) return true
+  return process.getuid?.() === 0
+}
 
 const _CF_IGNORE_DEFAULT_ARGS = ["--enable-automation"]
 
@@ -61,10 +67,99 @@ function sessionDir(sessionId: string): string {
   return dir
 }
 
-function appendJsonl(sessionId: string, file: string, obj: unknown) {
-  try {
-    appendFileSync(join(sessionDir(sessionId), file), JSON.stringify(obj) + "\n")
-  } catch {}
+// Writer assíncrono com batching por sessão. Mata o gargalo de I/O síncrono no hot path:
+// eventos de network/ws/console entram num buffer em memória e são gravados em lote,
+// fora do event loop crítico, via setImmediate. flushSync() força escrita imediata no fd
+// (usado antes de qualquer leitura de arquivo, pra readJsonl enxergar o que já foi bufferizado).
+class SessionWriter {
+  private fds = new Map<string, number>()
+  private buffers = new Map<string, string[]>()
+  private bytesWritten = new Map<string, number>()
+  private scheduled = false
+  private closed = false
+  private readonly MAX_BYTES: number
+  private readonly FLUSH_LINES = 500
+
+  constructor(private dir: string, maxBytes = 50 * 1024 * 1024) {
+    this.MAX_BYTES = maxBytes
+  }
+
+  private fd(file: string): number {
+    let fd = this.fds.get(file)
+    if (fd === undefined) {
+      fd = openSync(join(this.dir, file), "a")
+      this.fds.set(file, fd)
+      // arquivo pode já existir de sessão anterior: conta o tamanho pra respeitar o cap
+      try { this.bytesWritten.set(file, statSync(join(this.dir, file)).size) } catch { this.bytesWritten.set(file, 0) }
+    }
+    return fd
+  }
+
+  write(file: string, obj: unknown): void {
+    if (this.closed) return
+    if ((this.bytesWritten.get(file) ?? 0) >= this.MAX_BYTES) return // cap de disco, protege /tmp
+    const line = JSON.stringify(obj) + "\n"
+    const buf = this.buffers.get(file)
+    if (buf) buf.push(line)
+    else this.buffers.set(file, [line])
+    // flush imediato se o buffer desse arquivo estourou o limite de linhas
+    if ((this.buffers.get(file)!.length) >= this.FLUSH_LINES) this.flushFile(file)
+    else this.schedule()
+  }
+
+  private schedule(): void {
+    if (this.scheduled || this.closed) return
+    this.scheduled = true
+    // setImmediate: grava no fim do tick atual, sem bloquear o hot path que enfileirou os eventos
+    setImmediate(() => { this.scheduled = false; this.flushSync() })
+  }
+
+  private flushFile(file: string): void {
+    const buf = this.buffers.get(file)
+    if (!buf?.length) return
+    const chunk = buf.join("")
+    buf.length = 0
+    try {
+      writeSync(this.fd(file), chunk)
+      this.bytesWritten.set(file, (this.bytesWritten.get(file) ?? 0) + Buffer.byteLength(chunk))
+    } catch (e) {
+      // NÃO engole erro: disco cheio / permissão precisa ser visível
+      console.error(`[writer] ${file}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  // Grava todos os buffers pendentes imediatamente. Idempotente e barato quando não há nada pendente.
+  flushSync(): void {
+    for (const file of this.buffers.keys()) this.flushFile(file)
+  }
+
+  // Descarta buffers pendentes e zera os contadores de tamanho. Usado quando os arquivos .jsonl
+  // são truncados externamente (clear_session_storage) — senão o cap de disco seguiria contando
+  // bytes de conteúdo já apagado e o writer pararia de gravar.
+  reset(): void {
+    this.buffers.clear()
+    this.bytesWritten.clear()
+    for (const [file, fd] of this.fds.entries()) {
+      try { closeSync(fd) } catch {}
+      this.fds.delete(file)
+    }
+  }
+
+  close(): void {
+    if (this.closed) return
+    this.flushSync()
+    this.closed = true
+    for (const fd of this.fds.values()) {
+      try { fsyncSync(fd) } catch {}
+      try { closeSync(fd) } catch {}
+    }
+    this.fds.clear()
+  }
+}
+
+// Garante que tudo que o writer bufferizou esteja no disco antes de ler o arquivo.
+function flushSession(sessionId: string) {
+  sessions.get(sessionId)?.writer.flushSync()
 }
 
 function readJsonl<T = any>(sessionId: string, file: string): T[] {
@@ -112,15 +207,72 @@ interface DebugSession {
   videoPath?: string
   cdpSession?: any
   lockRelease?: () => void
+  writer: SessionWriter
+  networkIndex: WeakMap<object, NetworkRecord>
 }
 
 const sessions: Map<string, DebugSession> = new Map()
 
-function makeSession(opts: {
-  wsEndpoint?: string | null
-  status?: DebugSession["status"]
-  launched?: boolean
-}): DebugSession {
+// ── Warm pool (Wave 3) ──────────────────────────────────────────────────────
+// Sobe 1 Chrome headless em background e o deixa parado; o primeiro launch_browser
+// headless-simples pega esse já-quente → latência percebida ~0. Opt-in via env
+// PATCHRIGHT_PREWARM=1 (custa ~200MB de RAM parado). Reuso só quando os args batem.
+const PREWARM_ENABLED = process.env.PATCHRIGHT_PREWARM === "1"
+interface WarmEntry {
+  browser: Browser
+  argsKey: string
+}
+let warmBrowser: WarmEntry | null = null
+let warming = false
+
+// Assinatura dos parâmetros que afetam o processo do browser. Só reusamos o quente
+// quando bate exatamente — args/flags divergentes exigem um processo novo.
+function warmKey(args: string[]): string {
+  return JSON.stringify([...args].sort())
+}
+
+async function prewarm(launchArgs: string[]): Promise<void> {
+  if (!PREWARM_ENABLED || warmBrowser || warming) return
+  warming = true
+  try {
+    const browser = await chromium.launch({
+      headless: true,
+      channel: "chrome",
+      args: launchArgs.length ? launchArgs : undefined,
+    })
+    warmBrowser = { browser, argsKey: warmKey(launchArgs) }
+  } catch {
+    // prewarm é best-effort: se falhar, o launch normal cria do zero
+  } finally {
+    warming = false
+  }
+}
+
+// Tenta consumir o browser quente pra estes args. Devolve o Browser e agenda o próximo prewarm.
+function takeWarm(launchArgs: string[]): Browser | null {
+  if (!warmBrowser) return null
+  if (warmBrowser.argsKey !== warmKey(launchArgs)) return null
+  const b = warmBrowser.browser
+  warmBrowser = null
+  // repõe o pool em background pro próximo launch (não await: não bloqueia o atual)
+  void prewarm(launchArgs)
+  return b
+}
+
+const MAX_JSONL_BYTES = (() => {
+  const raw = process.env.PATCHRIGHT_MAX_JSONL_MB
+  const mb = raw ? Number(raw) : NaN
+  return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 50 * 1024 * 1024
+})()
+
+function makeSession(
+  sessionId: string,
+  opts: {
+    wsEndpoint?: string | null
+    status?: DebugSession["status"]
+    launched?: boolean
+  }
+): DebugSession {
   return {
     browser: null,
     context: null,
@@ -133,14 +285,17 @@ function makeSession(opts: {
     networkRecords: [],
     routes: new Map(),
     launched: opts.launched ?? false,
+    writer: new SessionWriter(sessionDir(sessionId), MAX_JSONL_BYTES),
+    networkIndex: new WeakMap(),
   }
 }
 
-function attachPageHandlers(session: DebugSession, page: Page, sessionId: string) {
+function attachPageHandlers(session: DebugSession, page: Page, _sessionId: string) {
+  const w = session.writer
   page.on("console", (msg) => {
     const entry = `[${msg.type()}] ${msg.text()}`
     session.consoleLogs.push(entry)
-    appendJsonl(sessionId, "console.jsonl", { t: Date.now(), type: msg.type(), text: msg.text() })
+    w.write("console.jsonl", { t: Date.now(), type: msg.type(), text: msg.text() })
   })
   page.on("request", (req) => {
     session.networkRequests.push(`${req.method()} ${req.url()}`)
@@ -152,37 +307,39 @@ function attachPageHandlers(session: DebugSession, page: Page, sessionId: string
       timestamp: Date.now(),
     }
     session.networkRecords.push(rec)
-    appendJsonl(sessionId, "network.jsonl", { phase: "request", ...rec })
+    // Wave 2: index O(1) pelo objeto Request do Playwright, some sozinho com o GC do request
+    session.networkIndex.set(req, rec)
+    w.write("network.jsonl", { phase: "request", ...rec })
   })
-  page.on("response", async (res) => {
-    const rec = session.networkRecords.find(
-      (r) => r.url === res.url() && !r.response
-    )
-    const responseData = {
-      status: res.status(),
-      url: res.url(),
-      headers: res.headers(),
-    }
-    if (rec) {
+  page.on("response", (res) => {
+    // Wave 2: pareamento O(1) via res.request() em vez de .find() O(n) no array
+    const rec = session.networkIndex.get(res.request())
+    if (rec && !rec.response) {
       try {
         rec.response = { status: res.status(), headers: res.headers() }
       } catch {}
     }
-    appendJsonl(sessionId, "network.jsonl", { phase: "response", t: Date.now(), ...responseData })
+    w.write("network.jsonl", {
+      phase: "response",
+      t: Date.now(),
+      status: res.status(),
+      url: res.url(),
+      headers: res.headers(),
+    })
   })
   page.on("websocket", (ws) => {
-    appendJsonl(sessionId, "ws.jsonl", { t: Date.now(), evt: "create", url: ws.url() })
+    w.write("ws.jsonl", { t: Date.now(), evt: "create", url: ws.url() })
     ws.on("framesent", (frame) => {
-      appendJsonl(sessionId, "ws.jsonl", { t: Date.now(), evt: "send", url: ws.url(), payload: typeof frame.payload === "string" ? frame.payload.slice(0, 5000) : `[binary ${(frame.payload as Buffer).length}b]` })
+      w.write("ws.jsonl", { t: Date.now(), evt: "send", url: ws.url(), payload: typeof frame.payload === "string" ? frame.payload.slice(0, 5000) : `[binary ${(frame.payload as Buffer).length}b]` })
     })
     ws.on("framereceived", (frame) => {
-      appendJsonl(sessionId, "ws.jsonl", { t: Date.now(), evt: "recv", url: ws.url(), payload: typeof frame.payload === "string" ? frame.payload.slice(0, 5000) : `[binary ${(frame.payload as Buffer).length}b]` })
+      w.write("ws.jsonl", { t: Date.now(), evt: "recv", url: ws.url(), payload: typeof frame.payload === "string" ? frame.payload.slice(0, 5000) : `[binary ${(frame.payload as Buffer).length}b]` })
     })
     ws.on("close", () => {
-      appendJsonl(sessionId, "ws.jsonl", { t: Date.now(), evt: "close", url: ws.url() })
+      w.write("ws.jsonl", { t: Date.now(), evt: "close", url: ws.url() })
     })
     ws.on("socketerror", (err) => {
-      appendJsonl(sessionId, "ws.jsonl", { t: Date.now(), evt: "error", url: ws.url(), error: String(err) })
+      w.write("ws.jsonl", { t: Date.now(), evt: "error", url: ws.url(), error: String(err) })
     })
   })
 }
@@ -316,6 +473,10 @@ const tools: Tool[] = [
           type: "array",
           items: { type: "string" },
           description: "Args extras pra Chrome (concatenados aos do cfBypass se ativo).",
+        },
+        noSandbox: {
+          type: "boolean",
+          description: "Adiciona --no-sandbox (opt-in por risco de segurança). Auto-ligado quando o processo roda como root. Default: false.",
         },
       },
       required: ["sessionId"],
@@ -1202,7 +1363,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "start_debug_session": {
         const wsEndpoint = (args as Record<string, string>).wsEndpoint
-        const session = makeSession({
+        const session = makeSession(sessionId, {
           wsEndpoint: wsEndpoint || null,
           status: "connecting",
         })
@@ -1231,7 +1392,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "ws_connect_local": {
         let session = sessions.get(sessionId)
         if (!session) {
-          session = makeSession({})
+          session = makeSession(sessionId, {})
           sessions.set(sessionId, session)
         }
 
@@ -1277,6 +1438,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           (args as Record<string, boolean>).lockProfile !== false
         const customUA = (args as Record<string, string>).userAgent
         const extraArgs = ((args as Record<string, string[]>).extraArgs || []) as string[]
+        const noSandbox = (args as Record<string, boolean>).noSandbox
 
         let lockHandle: { release: () => void } | undefined
         if (lockProfile && userDataDir) {
@@ -1292,13 +1454,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const launchArgs = [
           ...(cfBypass ? _CF_BYPASS_ARGS : []),
+          // evita crash de /dev/shm pequeno em Docker/container (Wave 3.3)
+          "--disable-dev-shm-usage",
+          ...(needsNoSandbox(noSandbox) ? ["--no-sandbox"] : []),
           ...extraArgs,
         ]
         const ignoreDefaultArgs = cfBypass ? _CF_IGNORE_DEFAULT_ARGS : undefined
         const effectiveUA = customUA || (cfBypass ? _REAL_CHROME_UA_LINUX : undefined)
 
+        // Wave 3.2: relançar com o mesmo sessionId não pode vazar o browser anterior.
+        // Fecha a sessão existente (browser/context/writer/lock) antes de recriar.
+        const prev = sessions.get(sessionId)
+        if (prev) {
+          try { prev.writer.close() } catch {}
+          try { if (prev.context && !prev.browser) await prev.context.close() } catch {}
+          try { await prev.browser?.close() } catch {}
+          try { prev.lockRelease?.() } catch {}
+          sessions.delete(sessionId)
+        }
+
         try {
-          const session = makeSession({
+          const session = makeSession(sessionId, {
             status: "connecting",
             launched: true,
           })
@@ -1316,12 +1492,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             session.context = ctx
             session.page = ctx.pages()[0] || (await ctx.newPage())
           } else {
-            const browser = await chromium.launch({
+            // Wave 3: reusa o browser quente quando os parâmetros batem (headless, sem cfBypass,
+            // args idênticos). Senão lança do zero. Cada launch dispara o prewarm do próximo.
+            const canReuse = headless && !cfBypass
+            const warm = canReuse ? takeWarm(launchArgs) : null
+            const browser = warm ?? await chromium.launch({
               headless,
               channel: "chrome",
               args: launchArgs.length ? launchArgs : undefined,
               ignoreDefaultArgs,
             })
+            if (!warm && canReuse) void prewarm(launchArgs)
             session.browser = browser
             const ctx = await browser.newContext({
               viewport,
@@ -2775,6 +2956,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "list_endpoints": {
+        flushSession(sessionId)
         const records = readJsonl<any>(sessionId, "network.jsonl").filter((r) => r.phase === "request")
         const hostPattern = (args as Record<string, string>).hostPattern
         const groupBy = ((args as Record<string, string>).groupBy || "host+path") as string
@@ -2796,6 +2978,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "query_network": {
+        flushSession(sessionId)
         const all = readJsonl<any>(sessionId, "network.jsonl")
         const urlPattern = (args as Record<string, string>).urlPattern
         const method = (args as Record<string, string>).method
@@ -2827,6 +3010,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "tail_ws": {
+        flushSession(sessionId)
         const all = readJsonl<any>(sessionId, "ws.jsonl")
         const limit = ((args as Record<string, number>).limit || 30) as number
         const urlPattern = (args as Record<string, string>).urlPattern
@@ -2845,6 +3029,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "ws_summary": {
+        flushSession(sessionId)
         const all = readJsonl<any>(sessionId, "ws.jsonl")
         const byUrl: Record<string, any> = {}
         for (const r of all) {
@@ -2857,6 +3042,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "session_storage_info": {
+        flushSession(sessionId)
         const dir = sessionDir(sessionId)
         const files = ["network.jsonl", "ws.jsonl", "console.jsonl"].map((f) => {
           const path = join(dir, f)
@@ -2874,6 +3060,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "clear_session_storage": {
         const session = sessions.get(sessionId)
+        // fecha fds e descarta buffers ANTES de truncar, pra não haver append concorrente
+        session?.writer.reset()
         const dir = sessionDir(sessionId)
         for (const f of ["network.jsonl", "ws.jsonl", "console.jsonl"]) {
           try { writeFileSync(join(dir, f), "") } catch {}
@@ -2887,6 +3075,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "export_session": {
+        flushSession(sessionId)
         const path = (args as Record<string, string>).path || join(sessionDir(sessionId), "export.json")
         const data = {
           sessionId,
@@ -2902,6 +3091,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "close_session": {
         const session = sessions.get(sessionId)
         if (session) {
+          // flush final: garante que os últimos eventos capturados vão pro disco
+          try { session.writer.close() } catch {}
           for (const page of session.pages.values()) {
             try { await page.close() } catch {}
           }
@@ -2953,5 +3144,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 })
 
+// Flush de todos os writers no shutdown, senão os últimos ≤1 tick de captura se perdem.
+let _shuttingDown = false
+function shutdown() {
+  if (_shuttingDown) return
+  _shuttingDown = true
+  for (const session of sessions.values()) {
+    try { session.writer.close() } catch {}
+  }
+  if (warmBrowser) {
+    try { void warmBrowser.browser.close() } catch {}
+    warmBrowser = null
+  }
+}
+process.on("SIGTERM", () => { shutdown(); process.exit(0) })
+process.on("SIGINT", () => { shutdown(); process.exit(0) })
+process.on("beforeExit", shutdown)
+
 const transport = new StdioServerTransport()
 server.connect(transport)
+
+// Prewarm no boot: mesma base de args de um launch headless simples (sem cfBypass/extraArgs).
+if (PREWARM_ENABLED) {
+  const baseArgs = ["--disable-dev-shm-usage", ...(needsNoSandbox(undefined) ? ["--no-sandbox"] : [])]
+  void prewarm(baseArgs)
+}

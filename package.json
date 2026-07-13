@@ -31,12 +31,12 @@
     "prepare": "tsc"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "latest",
-    "patchright": "latest"
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "patchright": "1.59.4"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "typescript": "latest"
+    "@types/node": "25.6.0",
+    "typescript": "6.0.3"
   },
   "engines": {
     "node": ">=18"
